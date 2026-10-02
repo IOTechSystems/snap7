@@ -300,8 +300,8 @@ word TS7Worker::RA_OutOfRange(PResFunReadItem ResItem, TEv &EV)
 //------------------------------------------------------------------------------
 word TS7Worker::RA_SizeOverPDU(PResFunReadItem ResItem, TEv &EV)
 {
-    ResItem->DataLength=SwapWord(0x0004);
-    ResItem->ReturnCode=byte(SwapWord(Code7DataOverPDU));
+    ResItem->DataLength=0;
+    ResItem->ReturnCode=0;
     ResItem->TransportSize=0x00;
     EV.EvRetCode=evrErrOverPDU;
     return 0;
@@ -370,16 +370,16 @@ word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar
 
     // Calcs size
 	Elements = SwapWord(ReqItemPar->Length);
-	Size=Multiplier*Elements;   
+	Size=Multiplier*Elements;
 	EV.EvSize=Size;
 
     // The sum of the items must not exceed the PDU size negotiated
-    if (PDURemainder-Size<=0)
+    if (PDURemainder <= 0 ||  Size > PDURemainder)
         return RA_SizeOverPDU(ResItemData, EV);
     else
         PDURemainder-=Size;
 
-    // More then 1 bit is not supported by S7 CPU 
+    // More then 1 bit is not supported by S7 CPU
     if ((ReqItemPar->TransportSize==S7WLBit) && (Size>1))
         return RA_OutOfRange(ResItemData, EV);
 
@@ -411,7 +411,7 @@ word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar
 		BitIndex  =Start & 0x07; // start bit
 		Start     =Start >> 3;   // start byte
 	}
-	
+
 	EV.EvStart=Start;
 
 	// Checks bounds
@@ -424,7 +424,7 @@ word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar
 	}
 
 	// Read Event (before copy data)
-    DoReadEvent(evcDataRead,0,EV.EvArea,EV.EvIndex,EV.EvStart,EV.EvSize);	
+    DoReadEvent(evcDataRead,0,EV.EvArea,EV.EvIndex,EV.EvStart,EV.EvSize);
 
 	if (FServer->ResourceLess)
 	{
@@ -484,7 +484,7 @@ word TS7Worker::ReadArea(PResFunReadItem ResItemData, PReqFunReadItem ReqItemPar
           ResItemData->TransportSize=TS_ResOctet;
 		  ResItemData->DataLength=SwapWord(Size);
         };break;
-      default : 
+      default :
         {
           ResItemData->TransportSize=TS_ResByte;
           ResItemData->DataLength=SwapWord(Size*8);
@@ -521,7 +521,9 @@ bool TS7Worker::PerformFunctionRead()
     // Stage 2 : gather data
     Offset=sizeof(TResFunReadParams);      // = 2
 
-    for (c = 0; c < ItemsCount; c++)
+	Answer.Header.Error=0x0000;
+
+    for (c = 0; c < ItemsCount && PDURemainder > 0; c++)
 	{
 		ResData[c]=PResFunReadItem(pbyte(ResParams)+Offset);
 		ItemSize=ReadArea(ResData[c],&ReqParams->Items[c],PDURemainder, EV);
@@ -529,25 +531,41 @@ bool TS7Worker::PerformFunctionRead()
         // S7 doesn't xfer odd byte amount
         if ((c<ItemsCount-1) && (ItemSize % 2 != 0))
 	      ItemSize++;
-		
+
         Offset+=(ItemSize+4);
         // For multiple items we have to create multiple events
         if (ItemsCount>1)
             DoEvent(evcDataRead,EV.EvRetCode,EV.EvArea,EV.EvIndex,EV.EvStart,EV.EvSize);
+
+    	if (PDURemainder < 0 || EV.EvRetCode == evrErrOverPDU)
+    	{
+    		Answer.Header.Error = SwapWord (Code7DataOverPDU);
+    		break;
+    	}
     }
     // Stage 3 : finalize the answer and send the packet
     Answer.Header.P=0x32;
-    Answer.Header.PDUType=0x03;
     Answer.Header.AB_EX=0x0000;
     Answer.Header.Sequence=PDUH_in->Sequence;
-    Answer.Header.ParLen=SwapWord(sizeof(TResFunReadParams));
-    Answer.Header.Error=0x0000; // this is zero, we will find the error in ResData.ReturnCode
-    Answer.Header.DataLen=SwapWord(word(Offset)-2);
+
+	if (Answer.Header.Error != 0)
+	{
+		Answer.Header.PDUType = pduResponse; // Error response (Ack with no data)
+		Answer.Header.ParLen = 0;
+		Answer.Header.DataLen = 0;
+		TotalSize = ResHeaderSize23;
+	}
+	else
+	{
+		Answer.Header.ParLen=SwapWord(sizeof(TResFunReadParams));
+		Answer.Header.PDUType= PduType_response;
+		Answer.Header.DataLen= SwapWord(word(Offset)-2);
+		TotalSize=ResHeaderSize23+int(Offset);
+	}
 
     ResParams->FunRead  =ReqParams->FunRead;
     ResParams->ItemCount=ReqParams->ItemsCount;
 
-    TotalSize=ResHeaderSize23+int(Offset);
     isoSendBuffer(&Answer, TotalSize);
 
     // For single item (most likely case) it's better to work with the event after
@@ -609,7 +627,7 @@ byte TS7Worker::WriteArea(PReqFunWriteDataItem ReqItemData, PReqFunWriteItem Req
 		DBNum=SwapWord(ReqItemPar->DBNumber);
 		EV.EvIndex=DBNum;
 	};
-	
+
 	if (!FServer->ResourceLess)
 	{
 		P=GetArea(ReqItemPar->Area, DBNum);
@@ -644,9 +662,9 @@ byte TS7Worker::WriteArea(PReqFunWriteDataItem ReqItemData, PReqFunWriteItem Req
 
     // Checks if the address is not multiple of 8 when transport size is neither bit nor timer nor counter
     if (
-		(ReqItemPar->TransportSize!=S7WLBit) && 
-		(ReqItemPar->TransportSize!=S7WLTimer) && 
-		(ReqItemPar->TransportSize!=S7WLCounter) && 
+		(ReqItemPar->TransportSize!=S7WLBit) &&
+		(ReqItemPar->TransportSize!=S7WLTimer) &&
+		(ReqItemPar->TransportSize!=S7WLCounter) &&
 		((Start % 8) !=0)
 	   )
 		return WA_OutOfRange(EV);
@@ -667,7 +685,7 @@ byte TS7Worker::WriteArea(PReqFunWriteDataItem ReqItemData, PReqFunWriteItem Req
 		Start = Start >> 3;   // start byte
 	}
 	EV.EvStart =Start;
-	
+
 	if (!FServer->ResourceLess)
 	{
 		// Checks bounds
@@ -708,7 +726,7 @@ byte TS7Worker::WriteArea(PReqFunWriteDataItem ReqItemData, PReqFunWriteItem Req
 			pcs->Leave();
 		};
 	}
-	
+
 	return 0xFF;
 }
 //------------------------------------------------------------------------------
@@ -736,7 +754,7 @@ bool TS7Worker::PerformFunctionWrite()
 	for (c = 0; c < ItemsCount; c++)
 	{
 		ReqData[c]=PReqFunWriteDataItem(pbyte(PDUH_in)+StartData);
-		
+
 		if ((ReqParams->Items[c].TransportSize == S7WLTimer) || (ReqParams->Items[c].TransportSize == S7WLCounter) || (ReqParams->Items[c].TransportSize == S7WLBit))
 			L = SwapWord(ReqData[c]->DataLength);
 		else
@@ -761,7 +779,7 @@ bool TS7Worker::PerformFunctionWrite()
 
     // Stage 3 : finalize the answer
     Answer.Header.P=0x32;
-    Answer.Header.PDUType=0x03;
+    Answer.Header.PDUType=PduType_response;
     Answer.Header.AB_EX=0x0000;
     Answer.Header.Sequence=PDUH_in->Sequence;
     Answer.Header.ParLen=SwapWord(0x02);
@@ -791,7 +809,7 @@ bool TS7Worker::PerformFunctionNegotiate()
 	ResParams=PResFunNegotiateParams(pbyte(&Answer)+sizeof(TS7ResHeader23));
 	// Prepares the answer
 	Answer.Header.P=0x32;
-	Answer.Header.PDUType=0x03;
+	Answer.Header.PDUType=PduType_response;
 	Answer.Header.AB_EX=0x0000;
 	Answer.Header.Sequence=PDUH_in->Sequence;
 	Answer.Header.ParLen=SwapWord(sizeof(TResFunNegotiateParams));
@@ -840,7 +858,7 @@ bool TS7Worker::PerformFunctionControl(byte PduFun)
     ResParams=PResFunCtrl(pbyte(&Answer)+sizeof(TS7ResHeader23));
     // Prepares the answer
     Answer.Header.P=0x32;
-    Answer.Header.PDUType=0x03;
+    Answer.Header.PDUType=PduType_response;
     Answer.Header.AB_EX=0x0000;
     Answer.Header.Sequence=PDUH_in->Sequence;
     Answer.Header.ParLen=SwapWord(0x0001); // We send only Res fun without para
